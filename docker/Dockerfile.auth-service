@@ -1,0 +1,39 @@
+FROM golang:1.23-alpine AS builder
+
+# Install dependencies
+RUN apk add --no-cache git
+
+WORKDIR /app
+
+# Copy shared dependencies
+COPY shared/ ./shared/
+
+# Copy auth service
+COPY services/auth-service/ ./services/auth-service/
+
+WORKDIR /app/services/auth-service
+
+# Clean and rebuild
+RUN rm -f go.sum
+RUN go clean -modcache
+RUN go mod tidy -v
+RUN go mod download -x
+
+# Build the application
+RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o main .
+
+# Use test config
+COPY services/auth-service/config/config-test.toml ./config/config.toml
+
+FROM alpine:latest
+
+RUN apk --no-cache add ca-certificates tzdata
+
+WORKDIR /root/
+
+COPY --from=builder /app/services/auth-service/main .
+COPY --from=builder /app/services/auth-service/config ./config
+
+EXPOSE 8001
+
+CMD ["./main", "-env", "prod"]
