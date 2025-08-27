@@ -1,0 +1,91 @@
+# Dynamic configuration for Traefik - Simplified for Testing
+
+# HTTP middlewares
+[http.middlewares]
+  # Default security headers for HTTP testing
+  [http.middlewares.default-headers.headers]
+    frameDeny = true
+    sslRedirect = false
+    browserXssFilter = true
+    contentTypeNosniff = true
+    isDevelopment = true
+    contentSecurityPolicy = "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'"
+
+  # CORS middleware
+  [http.middlewares.cors.headers]
+    accessControlAllowMethods = ["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"]
+    accessControlAllowOriginList = ["http://localhost", "http://localhost:3000"]
+    accessControlAllowHeaders = ["*"]
+    accessControlExposeHeaders = ["*"]
+    accessControlMaxAge = 86400
+    addVaryHeader = true
+
+  # Global rate limiting
+  [http.middlewares.global-ratelimit.rateLimit]
+    burst = 500
+    average = 1000
+    period = "1s"
+
+  # Auth rate limiting
+  [http.middlewares.auth-ratelimit.rateLimit]
+    burst = 25
+    average = 15
+    period = "1s"
+
+  # Login rate limiting  
+  [http.middlewares.auth-login-ratelimit.rateLimit]
+    burst = 10
+    average = 3
+    period = "1s"
+
+  # Strip prefix middleware for auth
+  [http.middlewares.auth-strip.stripPrefix]
+    prefixes = ["/api/v1"]
+
+  # Compression middleware
+  [http.middlewares.gzip.compress]
+    excludedContentTypes = ["text/event-stream"]
+
+# HTTP routers
+[http.routers]
+  # Frontend router
+  [http.routers.frontend]
+    rule = "Host(`localhost`) && !PathPrefix(`/api/`)"
+    entrypoints = ["web"]
+    middlewares = ["default-headers", "global-ratelimit", "gzip"]
+    service = "frontend"
+    priority = 1
+
+  # Auth Service Health Check router (takes precedence)
+  [http.routers.auth-health]
+    rule = "Host(`localhost`) && Path(`/health`)"
+    entrypoints = ["web"]
+    middlewares = ["default-headers", "global-ratelimit"]
+    service = "auth-service"
+    priority = 200
+
+  # Auth Service router - Unified (handles all user operations)
+  [http.routers.auth-service]
+    rule = "Host(`localhost`) && PathPrefix(`/api/v1/auth`)"
+    entrypoints = ["web"]
+    middlewares = ["default-headers", "global-ratelimit", "auth-ratelimit", "cors"]
+    service = "auth-service"
+    priority = 100
+
+# HTTP services
+[http.services]
+  # Frontend service
+  [http.services.frontend.loadBalancer]
+    [[http.services.frontend.loadBalancer.servers]]
+      url = "http://frontend:3000"
+
+  # Auth service
+  [http.services.auth-service.loadBalancer]
+    [http.services.auth-service.loadBalancer.healthCheck]
+      path = "/health"
+      interval = "30s"
+      timeout = "10s"
+      scheme = "http"
+    [[http.services.auth-service.loadBalancer.servers]]
+      url = "http://auth-service:8080"
+
