@@ -1,0 +1,134 @@
+#!/bin/bash
+# ===================================================================
+# Pre-commit Schema Validation Hook
+# Purpose: Prevent schema inconsistencies before commits
+# Author: Schema Consistency Prevention Plan
+# ===================================================================
+
+set -e
+
+echo "🔍 Pre-commit: Schema consistency validation..."
+
+# 1. Check if any migration files were modified
+if git diff --cached --name-only | grep -q "migrations/.*\.sql$"; then
+    echo "📝 Migration files detected - running validation..."
+    
+    # Start test database for validation
+    echo "🐳 Starting test database..."
+    docker-compose -f docker-compose.migration-test.yml up -d postgres-auth-test
+    
+    # Wait for database to be ready
+    echo "⏳ Waiting for database to be ready..."
+    sleep 15
+    
+    # Check if database is accessible
+    max_attempts=30
+    attempt=1
+    while [ $attempt -le $max_attempts ]; do
+        if docker exec postgres-auth-test pg_isready -U postgres > /dev/null 2>&1; then
+            echo "✅ Database ready after ${attempt} attempts"
+            break
+        fi
+        echo "🔄 Database not ready yet... (attempt $attempt/$max_attempts)"
+        sleep 2
+        attempt=$((attempt + 1))
+    done
+    
+    if [ $attempt -gt $max_attempts ]; then
+        echo "❌ Database failed to start within timeout"
+        docker-compose -f docker-compose.migration-test.yml down --volumes
+        exit 1
+    fi
+    
+    # Run migration validation
+    echo "🔍 Running migration validation..."
+    cd services/auth-service
+    
+    # Set environment variables for test database
+    export DB_HOST=localhost
+    export DB_PORT=5438
+    export DB_NAME=auth_db_test
+    export DB_USER=postgres
+    export DB_PASSWORD=testpassword
+    
+    if ! timeout 60s go run cmd/migrate/main.go validate; then
+        echo "❌ Schema validation failed. Commit blocked."
+        echo ""
+        echo "💡 Fix schema issues before committing:"
+        echo "   1. Update migration files to match GORM models"
+        echo "   2. Run: go run cmd/migrate/main.go validate"
+        echo "   3. Test with: docker-compose -f docker-compose.migration-test.yml up"
+        echo ""
+        
+        # Cleanup and exit
+        cd ../..
+        docker-compose -f docker-compose.migration-test.yml down --volumes
+        exit 1
+    fi
+    
+    echo "✅ Migration validation passed"
+    
+    # Cleanup
+    cd ../..
+    docker-compose -f docker-compose.migration-test.yml down --volumes
+    echo "🧹 Test database cleaned up"
+fi
+
+# 2. Check if any model files were modified  
+if git diff --cached --name-only | grep -q "internal/models/.*\.go$"; then
+    echo "📝 Model files detected - checking migration alignment..."
+    
+    # Check if corresponding migration exists for recent model changes
+    # This is a heuristic check - could be enhanced with more sophisticated analysis
+    LATEST_MIGRATION=$(find services/auth-service/migrations -name "*.sql" -type f | sort | tail -1)
+    
+    if [ -n "$LATEST_MIGRATION" ]; then
+        MIGRATION_DATE=$(basename "$LATEST_MIGRATION" | cut -d'_' -f1)
+        
+        # Check if latest migration is recent (within last 7 days)
+        # Use a more portable date comparison
+        if command -v date > /dev/null 2>&1; then
+            # Check if this is a Git Bash or Unix-like environment
+            if date -d "7 days ago" > /dev/null 2>&1; then
+                # GNU date (Linux/Git Bash)
+                if [[ $(date -d "$MIGRATION_DATE" +%s 2>/dev/null || echo 0) -lt $(date -d "7 days ago" +%s) ]]; then
+                    echo "⚠️  Warning: Model changes detected but no recent migration found"
+                    echo "💡 Consider creating a migration for model changes:"
+                    echo "   cd services/auth-service && go run cmd/migrate/main.go create DescribeYourChanges"
+                    # Warning only - don't block commit for model-only changes
+                fi
+            else
+                # BSD date (macOS) or other systems
+                echo "⚠️  Warning: Model changes detected - please verify migration alignment manually"
+                echo "💡 Consider creating a migration if needed:"
+                echo "   cd services/auth-service && go run cmd/migrate/main.go create DescribeYourChanges"
+            fi
+        else
+            echo "⚠️  Warning: Model changes detected - please verify migration alignment manually"
+        fi
+    else
+        echo "⚠️  Warning: Model changes detected but no migrations found"
+        echo "💡 Consider creating a migration for model changes:"
+        echo "   cd services/auth-service && go run cmd/migrate/main.go create DescribeYourChanges"
+    fi
+fi
+
+# 3. Check if any Docker configuration files were modified
+if git diff --cached --name-only | grep -qE "(docker-compose.*\.yml|Dockerfile)"; then
+    echo "📝 Docker configuration changes detected"
+    echo "💡 Remember to:"
+    echo "   1. Test Docker builds: docker-compose build"
+    echo "   2. Test Migration-First deployment: docker-compose -f docker-compose.migration-first.yml up"
+    echo "   3. Verify health checks and initialization scripts"
+fi
+
+# 4. Check for potential schema-breaking changes in Go code
+if git diff --cached --name-only | grep -qE "(internal/models|internal/repositories|migrations).*\.go$"; then
+    echo "📝 Schema-related Go code changes detected"
+    echo "💡 Recommended: Run full integration tests before pushing:"
+    echo "   make test-integration  # or your equivalent command"
+fi
+
+echo ""
+echo "✅ Pre-commit validation completed successfully"
+echo "🚀 Ready to commit schema-consistent changes"
