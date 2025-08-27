@@ -1,0 +1,426 @@
+# =========================================================
+# Migration-First Enhanced Docker Compose Configuration
+# Purpose: Production-ready deployment with Migration-First
+# Based on: SCHEMA_CONSISTENCY_PREVENTION_PLAN.md
+# =========================================================
+
+version: '3.8'
+
+networks:
+  msa-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+
+volumes:
+  auth_db_data:
+  redis_data:
+  kafka_data:
+  zookeeper_data:
+  traefik_data:
+  prometheus_data:
+  grafana_data:
+
+services:
+  # =====================================
+  # MIGRATION-FIRST DATABASE
+  # =====================================
+  
+  # Auth Service Database with Migration-First initialization
+  postgres-auth:
+    image: postgres:15-alpine
+    container_name: postgres-auth
+    restart: unless-stopped
+    networks:
+      msa-network:
+        ipv4_address: 172.20.0.20
+    environment:
+      POSTGRES_DB: ${AUTH_DB_NAME:-auth_db}
+      POSTGRES_USER: ${AUTH_DB_USER:-postgres}
+      POSTGRES_PASSWORD: ${AUTH_DB_PASSWORD}
+      POSTGRES_INITDB_ARGS: "--encoding=UTF-8 --lc-collate=C --lc-ctype=C"
+    volumes:
+      - auth_db_data:/var/lib/postgresql/data
+      # 🚨 CRITICAL: Migration-First initialization
+      - ./services/auth-service/migrations:/docker-entrypoint-initdb.d/migrations:ro
+      - ./scripts/docker/migration-runner.sh:/docker-entrypoint-initdb.d/01-migration-runner.sh:ro
+      - ./scripts/docker/post-migration-validation.sh:/docker-entrypoint-initdb.d/02-validation.sh:ro
+      # Create log directory mount
+      - ./logs/postgres:/var/log/postgresql
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: |
+        pg_isready -U ${AUTH_DB_USER:-postgres} -d ${AUTH_DB_NAME:-auth_db} &&
+        psql -U ${AUTH_DB_USER:-postgres} -d ${AUTH_DB_NAME:-auth_db} -c "SELECT COUNT(*) FROM schema_migrations;" > /dev/null &&
+        psql -U ${AUTH_DB_USER:-postgres} -d ${AUTH_DB_NAME:-auth_db} -c "SELECT status FROM migration_status WHERE status = 'ready';" > /dev/null
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+
+  # Test Database for Migration-First validation (separate instance)
+  postgres-auth-test:
+    image: postgres:15-alpine
+    container_name: postgres-auth-test
+    networks:
+      msa-network:
+        ipv4_address: 172.20.0.25
+    environment:
+      POSTGRES_DB: ${AUTH_DB_NAME:-auth_db}_test
+      POSTGRES_USER: ${AUTH_DB_USER:-postgres}
+      POSTGRES_PASSWORD: ${AUTH_DB_PASSWORD}
+      POSTGRES_INITDB_ARGS: "--encoding=UTF-8 --lc-collate=C --lc-ctype=C"
+    volumes:
+      # Same Migration-First initialization for test consistency
+      - ./services/auth-service/migrations:/docker-entrypoint-initdb.d/migrations:ro
+      - ./scripts/docker/migration-runner.sh:/docker-entrypoint-initdb.d/01-migration-runner.sh:ro
+      - ./scripts/docker/post-migration-validation.sh:/docker-entrypoint-initdb.d/02-validation.sh:ro
+      - ./logs/postgres-test:/var/log/postgresql
+    ports:
+      - "5438:5432"
+    healthcheck:
+      test: |
+        pg_isready -U ${AUTH_DB_USER:-postgres} -d ${AUTH_DB_NAME:-auth_db}_test &&
+        psql -U ${AUTH_DB_USER:-postgres} -d ${AUTH_DB_NAME:-auth_db}_test -c "SELECT COUNT(*) FROM schema_migrations;" > /dev/null
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # =====================================
+  # MIGRATION-FIRST SERVICES
+  # =====================================
+  
+  # Auth Service with Migration-First dependency
+  auth-service:
+    build: 
+      context: .
+      dockerfile: ./services/auth-service/Dockerfile
+    container_name: auth-service
+    restart: unless-stopped
+    networks:
+      msa-network:
+        ipv4_address: 172.20.1.1
+    environment:
+      - SERVICE_NAME=auth-service
+      - HTTP_PORT=8001
+      - GRPC_PORT=9001
+      - DB_HOST=postgres-auth
+      - DB_PORT=5432
+      - DB_NAME=${AUTH_DB_NAME:-auth_db}
+      - DB_USER=${AUTH_DB_USER:-postgres}
+      - DB_PASSWORD=${AUTH_DB_PASSWORD}
+      - REDIS_URL=redis://redis-cache:6379
+      - JWT_ACCESS_SECRET=${JWT_ACCESS_SECRET}
+      - JWT_REFRESH_SECRET=${JWT_REFRESH_SECRET}
+      - KAFKA_BROKERS=kafka:29092
+      - JAEGER_AGENT_HOST=jaeger
+      - JAEGER_AGENT_PORT=6831
+      # Migration-First validation on startup
+      - MIGRATION_VALIDATION_ENABLED=true
+      - MIGRATION_VALIDATION_TIMEOUT=30s
+    depends_on:
+      postgres-auth:
+        condition: service_healthy
+      redis-cache:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    volumes:
+      - ./config/services/auth-service:/app/config:ro
+      - ./logs/auth-service:/app/logs
+      # Mount migration CLI for service-level validation
+      - ./services/auth-service/cmd/migrate:/app/migrate:ro
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.auth.rule=PathPrefix(`/api/v1/auth`)"
+      - "traefik.http.routers.auth.entrypoints=websecure"
+      - "traefik.http.routers.auth.tls=true"
+      - "traefik.http.routers.auth.tls.certResolver=letsencrypt"
+      - "traefik.http.services.auth.loadbalancer.server.port=8001"
+      # Enhanced health check with schema validation
+      - "traefik.http.routers.auth-health.rule=PathPrefix(`/health/schema`)"
+      - "traefik.http.routers.auth-health.entrypoints=web"
+    healthcheck:
+      test: |
+        curl -f http://localhost:8001/health &&
+        curl -f http://localhost:8001/health/database &&
+        curl -f http://localhost:8001/health/schema
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  # =====================================
+  # MIGRATION-FIRST VALIDATION SERVICE
+  # =====================================
+  
+  # Schema Monitor Service (implements Phase 4 of prevention plan)
+  schema-monitor:
+    build:
+      context: ./services/auth-service
+      dockerfile: Dockerfile.schema-monitor
+    container_name: schema-monitor
+    restart: unless-stopped
+    networks:
+      msa-network:
+        ipv4_address: 172.20.1.20
+    environment:
+      - SERVICE_NAME=schema-monitor
+      - DB_HOST=postgres-auth
+      - DB_PORT=5432
+      - DB_NAME=${AUTH_DB_NAME:-auth_db}
+      - DB_USER=${AUTH_DB_USER:-postgres}
+      - DB_PASSWORD=${AUTH_DB_PASSWORD}
+      - MONITOR_INTERVAL=30m
+      - ALERT_WEBHOOK_URL=${SLACK_WEBHOOK_URL}
+      - ENVIRONMENT=${ENVIRONMENT:-development}
+    depends_on:
+      postgres-auth:
+        condition: service_healthy
+    volumes:
+      - ./logs/schema-monitor:/app/logs
+      - ./services/auth-service/cmd/migrate:/app/migrate:ro
+    command: ["./schema-monitor", "--interval=30m", "--environment=${ENVIRONMENT:-development}"]
+
+  # =====================================
+  # API GATEWAY WITH ENHANCED ROUTING
+  # =====================================
+  
+  traefik:
+    image: traefik:3.0
+    container_name: api-gateway
+    restart: unless-stopped
+    command:
+      - --api.dashboard=true
+      - --api.debug=true
+      - --log.level=INFO
+      - --log.format=json
+      - --accesslog=true
+      - --accesslog.format=json
+      - --entrypoints.web.address=:80
+      - --entrypoints.websecure.address=:443
+      - --entrypoints.traefik.address=:8080
+      - --entrypoints.grpc.address=:8443
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --providers.docker.network=msa-network
+      - --providers.file.filename=/etc/traefik/dynamic.toml
+      - --providers.file.watch=true
+      - --certificatesresolvers.letsencrypt.acme.tlschallenge=true
+      - --certificatesresolvers.letsencrypt.acme.email=${ACME_EMAIL:-admin@example.com}
+      - --certificatesresolvers.letsencrypt.acme.storage=/data/acme.json
+      - --metrics.prometheus=true
+      - --metrics.prometheus.addEntryPointsLabels=true
+      - --metrics.prometheus.addServicesLabels=true
+      - --tracing.jaeger=true
+      - --tracing.jaeger.samplingParam=1.0
+      - --tracing.jaeger.localAgentHostPort=jaeger:6831
+      - --ping=true
+      # Enhanced health checks with schema monitoring
+      - --ping.entryPoint=traefik
+    ports:
+      - "80:80"
+      - "443:443"
+      - "8080:8080"  # Dashboard
+      - "8443:8443"  # gRPC
+    networks:
+      msa-network:
+        ipv4_address: 172.20.0.10
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./config/traefik/dynamic.toml:/etc/traefik/dynamic.toml:ro
+      - ./config/traefik/migration-first.toml:/etc/traefik/migration-first.toml:ro
+      - traefik_data:/data
+    environment:
+      - ACME_EMAIL=${ACME_EMAIL:-admin@example.com}
+      - DOMAIN=${DOMAIN:-localhost}
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.dashboard.rule=Host(`traefik.${DOMAIN:-localhost}`)"
+      - "traefik.http.routers.dashboard.tls=true"
+      - "traefik.http.routers.dashboard.tls.certResolver=letsencrypt"
+      # Schema monitoring dashboard
+      - "traefik.http.routers.schema-monitor.rule=Host(`schema.${DOMAIN:-localhost}`)"
+      - "traefik.http.routers.schema-monitor.tls=true"
+      - "traefik.http.services.schema-monitor.loadbalancer.server.port=8080"
+    healthcheck:
+      test: ["CMD", "traefik", "healthcheck", "--ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    depends_on:
+      - auth-service
+      - schema-monitor
+
+  # =====================================
+  # INFRASTRUCTURE SERVICES
+  # =====================================
+  
+  # Redis Cache
+  redis-cache:
+    image: redis:7-alpine
+    container_name: redis-cache
+    restart: unless-stopped
+    networks:
+      msa-network:
+        ipv4_address: 172.20.0.30
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+      - ./config/messaging/redis.conf:/usr/local/etc/redis/redis.conf
+    command: redis-server /usr/local/etc/redis/redis.conf
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Apache Kafka for Event Streaming
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.4.0
+    container_name: zookeeper
+    restart: unless-stopped
+    networks:
+      msa-network:
+        ipv4_address: 172.20.0.34
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+      ZOOKEEPER_INIT_LIMIT: 5
+      ZOOKEEPER_SYNC_LIMIT: 2
+    volumes:
+      - zookeeper_data:/var/lib/zookeeper/data
+    ports:
+      - "2181:2181"
+    healthcheck:
+      test: ["CMD", "echo", "ruok", "|", "nc", "localhost", "2181"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  kafka:
+    image: confluentinc/cp-kafka:7.4.0
+    container_name: kafka-broker
+    restart: unless-stopped
+    networks:
+      msa-network:
+        ipv4_address: 172.20.0.35
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: 'zookeeper:2181'
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_INTERNAL:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092,PLAINTEXT_INTERNAL://kafka:29092
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT_INTERNAL
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
+      KAFKA_DELETE_TOPIC_ENABLE: 'true'
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    ports:
+      - "9092:9092"
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "kafka-topics", "--bootstrap-server", "localhost:9092", "--list"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # =====================================
+  # MONITORING & OBSERVABILITY
+  # =====================================
+  
+  # Jaeger Tracing with Migration-First integration
+  jaeger:
+    image: jaegertracing/all-in-one:1.45
+    container_name: jaeger
+    restart: unless-stopped
+    networks:
+      msa-network:
+        ipv4_address: 172.20.0.40
+    ports:
+      - "5775:5775/udp"
+      - "6831:6831/udp"
+      - "6832:6832/udp"
+      - "5778:5778"
+      - "16686:16686"  # UI
+      - "14268:14268"  # HTTP collector
+    environment:
+      - COLLECTOR_ZIPKIN_HTTP_PORT=9411
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:16686/"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  # Prometheus with Migration-First metrics
+  prometheus:
+    image: prom/prometheus:v2.45.0
+    container_name: prometheus
+    restart: unless-stopped
+    networks:
+      msa-network:
+        ipv4_address: 172.20.0.41
+    ports:
+      - "9090:9090"
+    volumes:
+      - prometheus_data:/prometheus
+      - ./config/monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - ./config/monitoring/migration-first-alerts.yml:/etc/prometheus/migration-first-alerts.yml
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--web.enable-lifecycle'
+      - '--web.enable-admin-api'
+      # Add Migration-First alerting rules
+      - '--alertmanager.url=http://alertmanager:9093'
+    depends_on:
+      - schema-monitor
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:9090/-/healthy"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  # Frontend Service
+  frontend:
+    build:
+      context: ../frontend
+      dockerfile: Dockerfile
+    container_name: frontend-app
+    restart: unless-stopped
+    networks:
+      msa-network:
+        ipv4_address: 172.20.1.10
+    environment:
+      - NODE_ENV=production
+      - NEXT_PUBLIC_API_URL=http://172.20.0.10
+      - NEXT_PUBLIC_AUTH_API_URL=http://172.20.0.10/api/v1/auth
+      - NEXT_PUBLIC_USER_API_URL=http://172.20.0.10/api/v1/auth
+      # Migration-First frontend configuration
+      - NEXT_PUBLIC_SCHEMA_MONITOR_URL=http://172.20.0.10/schema
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.frontend.rule=PathPrefix(`/`)"
+      - "traefik.http.routers.frontend.entrypoints=websecure"
+      - "traefik.http.routers.frontend.tls=true"
+      - "traefik.http.routers.frontend.tls.certResolver=letsencrypt"
+      - "traefik.http.routers.frontend.priority=1"
+      - "traefik.http.services.frontend.loadbalancer.server.port=3000"
+    depends_on:
+      - auth-service
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
